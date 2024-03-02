@@ -1,14 +1,22 @@
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::{backtrace, cell::RefCell, collections::HashSet, rc::Rc};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Rule {
+    Hoist,
+    Decorrelate,
+}
 
 #[derive(Debug, Clone)]
 struct State {
     next_id: Rc<RefCell<usize>>,
+    enabled_rules: Rc<RefCell<HashSet<Rule>>>,
 }
 
 impl State {
     fn new() -> Self {
         State {
             next_id: Rc::new(RefCell::new(0)),
+            enabled_rules: Rc::new(RefCell::new(HashSet::new())),
         }
     }
 
@@ -16,6 +24,15 @@ impl State {
         let id = *self.next_id.borrow();
         *self.next_id.borrow_mut() += 1;
         id
+    }
+
+    fn enable(&self, rule: Rule) {
+        let mut enabled_rules = self.enabled_rules.borrow_mut();
+        enabled_rules.insert(rule);
+    }
+
+    fn enabled(&self, rule: Rule) -> bool {
+        self.enabled_rules.borrow().contains(&rule)
     }
 }
 
@@ -129,19 +146,18 @@ enum RelExpr {
         right: Box<RelExpr>,
         predicates: Vec<Expr>,
     },
-    Map {
-        input: Box<RelExpr>,
-        exprs: Vec<(usize, Expr)>,
-    },
     Project {
         src: Box<RelExpr>,
         cols: HashSet<usize>,
     },
-    Apply {
+    Map {
+        input: Box<RelExpr>,
+        exprs: Vec<(usize, Expr)>,
+    },
+    FlatMap {
         input: Box<RelExpr>,
         func: Box<RelExpr>,
     },
-    Unit,
 }
 
 impl RelExpr {
@@ -210,8 +226,7 @@ impl RelExpr {
             }
             RelExpr::Project { src, .. } => src.has_subquery(),
             // TODO: wrong
-            RelExpr::Apply { input, func } => input.has_subquery() || func.has_subquery(),
-            RelExpr::Unit => false,
+            RelExpr::FlatMap { input, func } => input.has_subquery() || func.has_subquery(),
         }
     }
 
@@ -222,12 +237,13 @@ impl RelExpr {
                 assert!(att.len() == 1);
                 let input_col_id = att.iter().next().unwrap();
                 let rhs = expr.map(state, vec![(id, Expr::ColRef { id: *input_col_id })]);
-                self.apply(rhs)
+                self.flatmap(state, rhs)
             }
             Expr::Plus { left, right } => {
                 // Hoist the left, hoist the right, then perform the plus.
                 let lhs_id = state.next();
                 let rhs_id = state.next();
+                let att = self.att();
                 self.hoist(state, lhs_id, *left)
                     .hoist(state, rhs_id, *right)
                     .map(
@@ -240,6 +256,7 @@ impl RelExpr {
                             },
                         )],
                     )
+                    .project(state, att.into_iter().chain([id].into_iter()).collect())
             }
             Expr::Int { .. } | Expr::ColRef { .. } => self.map(state, vec![(id, expr)]),
             x => unimplemented!("{:?}", x),
@@ -253,23 +270,25 @@ impl RelExpr {
             return self;
         }
 
-        if let RelExpr::Map {
-            input,
-            exprs: mut existing,
-        } = self
-        {
-            existing.append(&mut exprs);
-            return RelExpr::Map {
-                input,
-                exprs: existing,
-            };
-        }
+        // if let RelExpr::Map {
+        //     input,
+        //     exprs: mut existing,
+        // } = self
+        // {
+        //     existing.append(&mut exprs);
+        //     return RelExpr::Map {
+        //         input,
+        //         exprs: existing,
+        //     };
+        // }
 
-        for i in 0..exprs.len() {
-            if exprs[i].1.has_subquery() {
-                // We're going to hoist this one.
-                let (id, expr) = exprs.swap_remove(i);
-                return self.map(state, exprs).hoist(state, id, expr);
+        if state.enabled(Rule::Hoist) {
+            for i in 0..exprs.len() {
+                // Only hoist expressions with subqueries.
+                if exprs[i].1.has_subquery() {
+                    let (id, expr) = exprs.swap_remove(i);
+                    return self.map(state, exprs).hoist(state, id, expr);
+                }
             }
         }
 
@@ -279,19 +298,43 @@ impl RelExpr {
         }
     }
 
-    fn apply(self, func: Self) -> Self {
-        // Not correlated!
-        if func.free().is_empty() {
-            return self.join(func, vec![]);
+    fn flatmap(self, state: &State, func: Self) -> Self {
+        if state.enabled(Rule::Decorrelate) {
+            // Not correlated!
+            if func.free().is_empty() {
+                return self.join(func, vec![]);
+            }
+
+            if let RelExpr::Project { src, mut cols } = func {
+                cols.extend(self.att());
+                return self.flatmap(state, *src).project(state, cols);
+            }
+
+            // Pull up Maps.
+            if let RelExpr::Map { input, exprs } = func {
+                return self.flatmap(state, *input).map(state, exprs);
+            }
         }
 
-        RelExpr::Apply {
+        RelExpr::FlatMap {
             input: Box::new(self),
             func: Box::new(func),
         }
     }
 
-    fn project(self, cols: HashSet<usize>) -> Self {
+    fn project(self, state: &State, cols: HashSet<usize>) -> Self {
+        // Push project into Map if we can.
+        if let RelExpr::Map { exprs, .. } = &self {
+            let map_required_cols: HashSet<_> =
+                exprs.iter().flat_map(|(_, expr)| expr.free()).collect();
+            if cols.is_subset(&map_required_cols) {
+                // Guaranteed to work.
+                if let RelExpr::Map { input, exprs } = self {
+                    return input.project(state, cols).map(state, exprs);
+                }
+            }
+        }
+
         RelExpr::Project {
             src: Box::new(self),
             cols,
@@ -313,8 +356,7 @@ impl RelExpr {
                 set
             }
             RelExpr::Project { cols, .. } => cols.clone(),
-            RelExpr::Unit => HashSet::new(),
-            RelExpr::Apply { input, func } => {
+            RelExpr::FlatMap { input, func } => {
                 let mut set = input.att();
                 set.extend(func.att());
                 set
@@ -331,7 +373,34 @@ impl RelExpr {
                 }
                 set.difference(&input.att()).copied().collect()
             }
-            _ => HashSet::new(),
+            RelExpr::FlatMap { input, func } => {
+                let mut set = input.free();
+                set.extend(func.free());
+                set.difference(&input.att()).copied().collect()
+            }
+            RelExpr::Scan { .. } => HashSet::new(),
+            RelExpr::Select { src, predicates } => {
+                let mut set = src.free();
+                for expr in predicates {
+                    set.extend(expr.free());
+                }
+                set.difference(&src.att()).copied().collect()
+            }
+            RelExpr::Join {
+                left,
+                right,
+                predicates,
+            } => {
+                let mut set = left.free();
+                set.extend(right.free());
+                for expr in predicates {
+                    set.extend(expr.free());
+                }
+                set.difference(&left.att().union(&right.att()).copied().collect())
+                    .copied()
+                    .collect()
+            }
+            RelExpr::Project { src, .. } => src.free(),
         }
     }
 
@@ -342,7 +411,7 @@ impl RelExpr {
                 column_names,
             } => {
                 out.push_str(&format!(
-                    "{}-> scan({:?}, {:?})",
+                    "{}-> scan({:?}, {:?})\n",
                     " ".repeat(indent),
                     table_name,
                     column_names
@@ -373,9 +442,7 @@ impl RelExpr {
                 }
                 out.push_str(")\n");
                 left.print(indent + 2, out);
-                out.push('\n');
                 right.print(indent + 2, out);
-                out.push('\n');
             }
             RelExpr::Map { input, exprs } => {
                 out.push_str(&format!("{}-> map(\n", " ".repeat(indent)));
@@ -388,18 +455,13 @@ impl RelExpr {
                 input.print(indent + 2, out);
             }
             RelExpr::Project { src, cols } => {
-                out.push_str(&format!("{}-> project\n", " ".repeat(indent)));
+                out.push_str(&format!("{}-> project({:?})\n", " ".repeat(indent), cols));
                 src.print(indent + 2, out);
-                out.push('\n');
-                out.push_str(&format!("{}{:?},\n", " ".repeat(indent + 2), cols));
             }
-            RelExpr::Unit => {
-                out.push_str(&format!("{}-> unit\n", " ".repeat(indent)));
-            }
-            RelExpr::Apply { input, func } => {
-                out.push_str(&format!("{}-> apply\n", " ".repeat(indent)));
+            RelExpr::FlatMap { input, func } => {
+                out.push_str(&format!("{}-> flatmap\n", " ".repeat(indent)));
                 input.print(indent + 2, out);
-                out.push_str(&format!("{}  λ.\n", " ".repeat(indent)));
+                out.push_str(&format!("{}  λ.{:?}\n", " ".repeat(indent), func.free()));
                 func.print(indent + 2, out);
             }
         }
@@ -408,39 +470,56 @@ impl RelExpr {
 
 fn main() {
     let state = State::new();
-    let left = RelExpr::scan("a".into(), vec![0, 1]);
-    let right = RelExpr::scan("x".into(), vec![2, 3]);
-    let sub = RelExpr::scan("x".into(), vec![4, 5]).project([4].into_iter().collect());
+    state.enable(Rule::Hoist);
+    state.enable(Rule::Decorrelate);
 
-    let join = left
-        .join(
-            right,
-            vec![
-                Expr::col_ref(0).eq(Expr::int(100)),
-                Expr::col_ref(1).eq(Expr::int(200)),
-            ],
-        )
-        .map(
-            &state,
-            vec![
-                (6, Expr::col_ref(0).plus(Expr::col_ref(2))),
-                (
-                    7,
-                    Expr::Subquery {
-                        expr: Box::new(sub.clone()),
-                    },
-                ),
-                (
-                    8,
-                    Expr::int(3).plus(Expr::Subquery {
-                        expr: Box::new(sub),
-                    }),
-                ),
-            ],
-        );
+    let a = state.next();
+    let b = state.next();
+    let x = state.next();
+    let y = state.next();
+
+    let sum_col = state.next();
+
+    let v = RelExpr::scan("a".into(), vec![a, b]).map(
+        &state,
+        vec![
+            // (
+            //     state.next(),
+            //     Expr::int(3).plus(Expr::Subquery {
+            //         expr: Box::new(
+            //             RelExpr::scan("x".into(), vec![x, y]).project([x].into_iter().collect()),
+            //         ),
+            //     }),
+            // ),
+            (
+                state.next(),
+                Expr::int(4).plus(Expr::Subquery {
+                    expr: Box::new(
+                        RelExpr::scan("x".into(), vec![x, y])
+                            .project(&state, [x].into_iter().collect())
+                            .map(&state, [(sum_col, Expr::col_ref(x).plus(Expr::col_ref(a)))])
+                            .project(&state, [sum_col].into_iter().collect()),
+                    ),
+                }),
+            ),
+        ],
+    );
+
+    // let v = RelExpr::scan("a".into(), vec![a, b]).map(
+    //     &state,
+    //     vec![(
+    //         state.next(),
+    //         Expr::Subquery {
+    //             expr: Box::new(
+    //                 RelExpr::scan("x".into(), vec![x, y])
+    //                     .project(&state, [x].into_iter().collect()),
+    //             ),
+    //         },
+    //     )],
+    // );
 
     let mut out = String::new();
-    join.print(0, &mut out);
+    v.print(0, &mut out);
 
     println!("{}", out);
 }
